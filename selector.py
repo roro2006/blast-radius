@@ -27,6 +27,8 @@ from pathlib import Path
 DATA = Path(os.environ.get("DATA", "/data"))
 SRC = Path(os.environ.get("SRC", "/app/sqlglot"))
 MAPS = Path(os.environ.get("MAPS", Path(__file__).resolve().parent / "maps" / "maps.json.gz"))
+IMPORTS = Path(os.environ.get("IMPORTS", Path(__file__).resolve().parent / "maps" / "imports.json.gz"))
+COND = Path(os.environ.get("COND", Path(__file__).resolve().parent / "maps" / "cond.json.gz"))
 CMP = Path(os.environ.get("CMP", Path(__file__).resolve().parent / "maps" / "cmp.json.gz"))
 WORKER_MS = 2000
 MAX_WORKERS = 8
@@ -126,14 +128,18 @@ def changed_old_lines(hunks):
     res = set()
     for start, body in hunks:
         o = start
+        replacing = False  # "+" lines right after "-" lines replace them: no neighbours
         for l in body:
             if l[0] == "-":
                 res.add(o)
                 o += 1
+                replacing = True
             elif l[0] == "+":
-                res.update({o - 1, o})
+                if not replacing:
+                    res.update({o - 1, o})
             else:
                 o += 1
+                replacing = False
     return {l for l in res if l > 0}
 
 
@@ -245,6 +251,163 @@ def only_safe_swaps(old_text, new_text, safe):
     return swapped and ast.dump(old) == ast.dump(new)
 
 
+def lambda_changes(old_text, new_text):
+    """The old file's lambdas whose bodies changed, when nothing else in the file changed
+    (else None). A lambda body runs only when the lambda is called, so its own line
+    coverage says exactly which tests can see the change."""
+    try:
+        old, new = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return None
+    a = [n for n in ast.walk(old) if isinstance(n, ast.Lambda)]
+    b = [n for n in ast.walk(new) if isinstance(n, ast.Lambda)]
+    if len(a) != len(b):
+        return None
+    changed = [x for x, y in zip(a, b) if ast.dump(x.body) != ast.dump(y.body)]
+    if not changed:
+        return None
+    spans = [(x.body.lineno, x.body.end_lineno) for x in changed]
+    for x in a + b:
+        x.body = ast.Constant(None)
+    # with every lambda body blanked the files must be identical (positions ignored)
+    return spans if ast.dump(old) == ast.dump(new) else None
+
+
+def constant_only(old_text, new_text):
+    """True when the files differ only in constants, each keeping its type (so a class- or
+    module-level statement still evaluates without error at import)."""
+    try:
+        old, new = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return False
+    a = [n for n in ast.walk(old) if isinstance(n, ast.Constant)]
+    b = [n for n in ast.walk(new) if isinstance(n, ast.Constant)]
+    if len(a) != len(b) or any(type(x.value) is not type(y.value) for x, y in zip(a, b)):
+        return False
+    for x in a + b:
+        x.value = None
+    return ast.dump(old) == ast.dump(new)
+
+
+CLASS_HOOKS = {"__init_subclass__", "__set_name__"}
+
+
+def enclosing_func(index, line):
+    best = None
+    for s in index:
+        if isinstance(s.node, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.lo <= line <= s.end                 and (best is None or s.lo >= best.lo):
+            best = s
+    return best
+
+
+# -- condition profile: per-test outcomes of and/or chains and comparisons
+
+PURE_CALLS = {"isinstance", "issubclass", "len", "type", "bool", "hasattr", "callable"}
+PURE_METHODS = {"get", "startswith", "endswith", "isupper", "islower", "isdigit", "isalpha",
+                "isidentifier"}
+
+
+def pure(n):
+    """Skipping this expression cannot change anything (no calls with effects)."""
+    if isinstance(n, (ast.Name, ast.Constant)):
+        return True
+    if isinstance(n, ast.Attribute):
+        return pure(n.value)
+    if isinstance(n, ast.Subscript):
+        return pure(n.value) and pure(n.slice)
+    if isinstance(n, (ast.Tuple, ast.List, ast.Set)):
+        return all(map(pure, n.elts))
+    if isinstance(n, ast.UnaryOp):
+        return pure(n.operand)
+    if isinstance(n, ast.BoolOp):
+        return all(map(pure, n.values))
+    if isinstance(n, ast.Compare):
+        return pure(n.left) and all(map(pure, n.comparators))
+    if isinstance(n, ast.Call) and not n.keywords:
+        f = n.func
+        if (isinstance(f, ast.Name) and f.id in PURE_CALLS) or \
+                (isinstance(f, ast.Attribute) and f.attr in PURE_METHODS and pure(f.value)):
+            return all(map(pure, n.args))
+    return False
+
+
+ORDER_PAIRS = {frozenset((ast.Lt, ast.LtE)): "e", frozenset((ast.Gt, ast.GtE)): "e",
+               frozenset((ast.Lt, ast.Gt)): "n", frozenset((ast.LtE, ast.GtE)): "n",
+               frozenset((ast.Is, ast.Eq)): "d", frozenset((ast.IsNot, ast.NotEq)): "d"}
+CMP_TYPES = (ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Is, ast.IsNot, ast.Eq, ast.NotEq)
+
+
+def cond_changes(old_text, new_text):
+    """When the files differ only in and<->or of chains (same operands) and in comparison
+    operators the profile can judge, the old tree and [(old node, kind, detail)]; else None."""
+    try:
+        old, new = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return None
+    ob = [n for n in ast.walk(old) if isinstance(n, ast.BoolOp)]
+    nb = [n for n in ast.walk(new) if isinstance(n, ast.BoolOp)]
+    oc = [n for n in ast.walk(old) if isinstance(n, ast.Compare) and len(n.ops) == 1
+          and isinstance(n.ops[0], CMP_TYPES)]
+    nc = [n for n in ast.walk(new) if isinstance(n, ast.Compare) and len(n.ops) == 1
+          and isinstance(n.ops[0], CMP_TYPES)]
+    if len(ob) != len(nb) or len(oc) != len(nc):
+        return None
+    changes = []
+    for x, y in zip(ob, nb):
+        if type(x.op) is not type(y.op):
+            if len(x.values) != len(y.values):
+                return None
+            changes.append((x, "B", isinstance(y.op, ast.And)))
+            y.op = type(x.op)()
+    for x, y in zip(oc, nc):
+        tx, ty = type(x.ops[0]), type(y.ops[0])
+        if tx is ty:
+            continue
+        kind = ORDER_PAIRS.get(frozenset((tx, ty)))
+        if kind is None:
+            return None
+        changes.append((x, "C", kind))
+        y.ops = [tx()]
+    # with the changes undone the trees must be identical, which also means the pairing
+    # above lined up the right nodes
+    if not changes or ast.dump(old) != ast.dump(new):
+        return None
+    return old, changes
+
+
+def truth_context(node, parents):
+    """Only the truth of this expression's value is used (an if/while/assert test, ...)."""
+    p = parents.get(node)
+    if isinstance(p, (ast.If, ast.While, ast.IfExp, ast.Assert)) and p.test is node:
+        return True
+    if isinstance(p, ast.comprehension) and node in p.ifs:
+        return True
+    if isinstance(p, ast.UnaryOp) and isinstance(p.op, ast.Not):
+        return True
+    if isinstance(p, ast.BoolOp):
+        return truth_context(p, parents)
+    return False
+
+
+def bool_flip_differs(state, node, new_is_and):
+    """Does flipping and<->or change an evaluation that ended in `state` = (k, t)?"""
+    k, t = state
+    n, old_is_and = len(node.values), isinstance(node.op, ast.And)
+    known = {i: old_is_and for i in range(k)}  # `and` went on past truthy, `or` past falsy
+    known[k] = t
+    j = 0
+    while True:
+        if j not in known:
+            return True  # the new operator evaluates an operand the old one never reached
+        if j == n - 1 or known[j] != new_is_and:
+            break
+        j += 1
+    if known[j] != t:
+        return True
+    # it stops earlier: the operands it now skips must have no effects
+    return not all(pure(node.values[i]) for i in range(j + 1, k + 1))
+
+
 def s_has_doc(node):
     b = node.body[0] if node.body else None
     return isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant) and isinstance(b.value.value, str)
@@ -276,6 +439,9 @@ class Selector:
         self.fixtures = doc["fixtures"]
         self.uses = doc["uses"]
         self.cmp = load_cmp()
+        self._imports = None
+        self._cond = None
+        self._module_uses = None
         self.by_file = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
@@ -343,6 +509,124 @@ class Selector:
             return self.nums(sid)
         return None  # never instantiated (mixin, holder): caller stays unscoped
 
+    def class_creation(self, f, index, line, s):
+        """Code that runs while classes are created (at import, credited to whichever test
+        imported first): __init_subclass__ / __set_name__, and metaclass __new__/__init__."""
+        fn = enclosing_func(index, line)
+        if fn is None or not fn.cls:
+            return set()
+        name = fn.node.name
+        if name in CLASS_HOOKS:
+            users = self.class_users(f, fn.cls)
+            return users if users is not None else self.runtime_tests(f)
+        if name in ("__new__", "__init__"):
+            meta = next((x for x in index if isinstance(x.node, ast.ClassDef)
+                         and x.node.name == fn.cls.split(".")[-1]), None)
+            if meta and any(isinstance(b, ast.Name) and b.id == "type" for b in meta.node.bases):
+                res = set(self.runtime_tests(f))
+                for x in index:
+                    if isinstance(x.node, ast.ClassDef) and any(
+                            isinstance(k.value, ast.Name) and k.value.id == meta.node.name
+                            for k in x.node.keywords if k.arg == "metaclass"):
+                        res |= self.class_users(f, x.cls + "." + x.node.name if x.cls else x.node.name) or set()
+                return res
+        return set()
+
+    def import_users(self, f, s, index):
+        """Everyone a failed import of f would break: every test if sqlglot itself imports f,
+        else the tests running code in f or in any module that (transitively) imports it."""
+        imp = self.imports()
+        if f in imp["eager"]:
+            return self.all_tests()
+        res, seen, todo = set(), set(), [f]
+        while todo:
+            m = todo.pop()
+            if m in seen:
+                continue
+            seen.add(m)
+            for sid in self.lines.get(m, {}).values():
+                res |= self.nums(sid)
+            # modules loaded by name at runtime (dialects) have no static importer, but every
+            # test that needs one instantiates a class from it
+            for sid in self.module_uses().get(m[:-3].replace("/", ".").removesuffix(".__init__"), ()):
+                res |= self.nums(sid)
+            todo.extend(imp["importers"].get(m, ()))
+        return res
+
+    def module_uses(self):
+        if self._module_uses is None:
+            self._module_uses = {}
+            for qual, sid in self.uses.items():
+                mod = qual
+                while "." in mod:  # every enclosing module/class prefix of the qualname
+                    mod = mod.rsplit(".", 1)[0]
+                    self._module_uses.setdefault(mod, []).append(sid)
+        return self._module_uses
+
+    def imports(self):
+        if self._imports is None:
+            try:
+                with gzip.open(IMPORTS, "rt") as fh:
+                    d = json.load(fh)
+                self._imports = {"eager": set(d["eager"]), "importers": d["importers"]}
+            except FileNotFoundError:
+                raise RunAll("no import map")
+        return self._imports
+
+    def cond(self):
+        if self._cond is None:
+            try:
+                with gzip.open(COND, "rt") as fh:
+                    d = json.load(fh)
+            except FileNotFoundError:
+                d = None
+            if d is not None:
+                sets = []
+                for packed in d["sets"]:
+                    s, acc = [], 0
+                    for i, x in enumerate(packed):
+                        acc = x if i == 0 else acc + x
+                        s.append(acc)
+                    sets.append(s)
+                num_of = [self.num_by_id.get(i) for i in d["tests"]]
+                d["nums"] = lambda sid: {n for n in (num_of[i] for i in sets[sid]) if n is not None}
+                d["bad"] = {f: set(k) for f, k in d["bad"].items()}
+            self._cond = d or {}
+        return self._cond
+
+    def cond_affected(self, f, old_text, new_text):
+        """Tests whose recorded condition outcomes the edit could change, or None when the
+        edit is not one the condition profile can judge."""
+        c = self.cond()
+        if not c:
+            return None
+        found = cond_changes(old_text, new_text)
+        if found is None:
+            return None
+        tree, changes = found
+        sites, bad = c["sites"].get(f, {}), c["bad"].get(f, set())
+        parents = {ch: p for p in ast.walk(tree) for ch in ast.iter_child_nodes(p)}
+        res = set()
+        for node, what, arg in changes:
+            key = f"{what}:{node.lineno}:{node.col_offset}"
+            if key in bad:
+                return None
+            states = sites.get(key, {})  # never evaluated by any test: nobody affected
+            if what == "C":
+                for st in ((arg, "x") if arg != "d" else ("d",)):
+                    if st in states:
+                        res |= c["nums"](states[st])
+                continue
+            truth = truth_context(node, parents)
+            for st, sid in states.items():
+                if st == "r" or (st == "v" and not truth):
+                    res |= c["nums"](sid)
+                elif st not in ("v", "r"):
+                    k, t = st.strip("()").split(", ")
+                    if bool_flip_differs((int(k), t == "True"), node, arg):
+                        res |= c["nums"](sid)
+        return res
+
     def all_tests(self):
         return {t["number"] for t in self.tests}
 
@@ -360,7 +644,16 @@ class Selector:
             sel |= set(self.by_file.get("tests/test_typing.py", []))  # compares source/code objects
         if only_safe_swaps(old_text, new_text, self.cmp.get(f)):
             return sel
+        affected = self.cond_affected(f, old_text, new_text)
+        if affected is not None:
+            return sel | affected
+        spans = lambda_changes(old_text, new_text)
+        if spans is not None:
+            for lo, hi in spans:
+                sel |= self.covering(f, lo, hi)
+            return sel
         index = self.tree(f, old_text)
+        consts = None
         for line in changed_old_lines(hunks):
             s = innermost(index, line)
             if s is None:
@@ -370,7 +663,15 @@ class Selector:
             if s.in_func:
                 hi = s.hdr if line <= s.hdr else s.end
                 sel |= self.covering(f, s.lo, hi)
+                sel |= self.class_creation(f, index, line, s)
                 continue
+            if not s.doc:
+                if consts is None:
+                    consts = constant_only(old_text, new_text)
+                if not consts:
+                    # anything but a same-type constant swap can fail at import, which breaks
+                    # every user of the class (or module), not just the readers of the name
+                    sel |= self.import_users(f, s, index)
             node = s.node
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if line > s.hdr:

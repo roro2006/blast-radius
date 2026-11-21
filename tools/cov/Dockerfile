@@ -9,6 +9,6 @@ d=urllib.request.urlopen('https://github.com/tobymao/sqlglot/archive/$SQLGLOT_SH
 tarfile.open(fileobj=io.BytesIO(d)).extractall('/', filter='data')" \
  && mv /sqlglot-$SQLGLOT_SHA /sqlglot
 ENV PYTHONPATH=/sqlglot SKIP_INTEGRATION=0 COVERAGE_CORE=ctrace PYTHONDONTWRITEBYTECODE=1
-COPY ctxplugin.py cmpplugin.py dump.py run.sh cmprun.sh /cov/
+COPY ctxplugin.py cmpplugin.py condplugin.py dump.py run.sh cmprun.sh /cov/
 WORKDIR /sqlglot
 CMD ["bash", "/cov/run.sh"]
