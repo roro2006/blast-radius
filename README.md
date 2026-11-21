@@ -39,7 +39,7 @@ and saved ~0.01 s, hence off.
 `test_max_nodes` (~29 s) and `test_execute_tpcds` (~21 s) cover thousands of core parser,
 optimizer and executor lines, so the maps pick them for most core edits, though few of those
 edits break them. When dropping them would lower a commit's cost by more than the check's
-CPU (counted at three times our local CPU, plus a margin), a forked child imports the
+CPU (counted at 1.8 times our local CPU, plus a margin), a forked child imports the
 patched sqlglot from a symlinked mirror of the pinned tree (`/tmp/w`, bytecode precompiled
 at build time) and checks them directly:
 

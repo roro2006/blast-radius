@@ -34,7 +34,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 MAP = Path(os.environ.get("HEAVY_MAP", HERE / "maps" / "heavy.json.gz"))
 TABLES = Path(os.environ.get("HEAVY_TABLES", HERE / "heavy_tables.pkl"))
-CPU_MULT = float(os.environ.get("HEAVY_CPU_MULT", "3"))  # board CPU / our local CPU
+CPU_MULT = float(os.environ.get("HEAVY_CPU_MULT", "1.8"))  # board CPU / local CPU (board run @c1d4608: 2.05 s vs 1.36 s)
 IMPORT_CPU = 0.5       # child: import patched sqlglot, optimizer, executor, duckdb dialect
 TABLES_CPU = 0.25      # unpickling the fixture rows and building Tables
 MAXN_CPU = 0.5
