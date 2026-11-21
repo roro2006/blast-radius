@@ -7,7 +7,7 @@ d=urllib.request.urlopen('https://github.com/tobymao/sqlglot/archive/$SQLGLOT_SH
 tarfile.open(fileobj=io.BytesIO(d)).extractall('/app', filter='data')" \
  && mv /app/sqlglot-$SQLGLOT_SHA /app/sqlglot && chmod -R a+rX /app
 COPY selector.py /app/selector.py
-COPY maps/maps.json.gz /app/maps/maps.json.gz
+COPY maps /app/maps
 RUN chmod -R a+rX /app
 ENV PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "-I", "/app/selector.py"]

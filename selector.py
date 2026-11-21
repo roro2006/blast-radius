@@ -27,6 +27,7 @@ from pathlib import Path
 DATA = Path(os.environ.get("DATA", "/data"))
 SRC = Path(os.environ.get("SRC", "/app/sqlglot"))
 MAPS = Path(os.environ.get("MAPS", Path(__file__).resolve().parent / "maps" / "maps.json.gz"))
+CMP = Path(os.environ.get("CMP", Path(__file__).resolve().parent / "maps" / "cmp.json.gz"))
 WORKER_MS = 2000
 MAX_WORKERS = 8
 
@@ -52,6 +53,14 @@ def load_maps():
             s.append(acc)
         sets.append(s)
     return doc, sets
+
+
+def load_cmp():
+    try:
+        with gzip.open(CMP, "rt") as f:
+            return {k: set(v) for k, v in json.load(f).items()}
+    except FileNotFoundError:
+        return {}
 
 
 # --------------------------------------------------------------------------- patches
@@ -201,6 +210,41 @@ def innermost(index, line):
     return best
 
 
+FAMILY = {ast.Is: ast.Eq, ast.Eq: ast.Eq, ast.IsNot: ast.NotEq, ast.NotEq: ast.NotEq}
+
+
+def eq_compares(tree):
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.Compare) and len(n.ops) == 1 and type(n.ops[0]) in FAMILY]
+
+
+def only_safe_swaps(old_text, new_text, safe):
+    """True when the new file differs from the old only by `is` <-> `==` / `is not` <-> `!=`
+    at comparisons the profile saw agree both ways on every evaluation (so every value the
+    program computes is unchanged)."""
+    if not safe:
+        return False
+    try:
+        old, new = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return False
+    a, b = eq_compares(old), eq_compares(new)
+    if len(a) != len(b):
+        return False
+    swapped = False
+    for x, y in zip(a, b):
+        tx, ty = type(x.ops[0]), type(y.ops[0])
+        if tx is ty:
+            continue
+        if FAMILY[tx] is not FAMILY[ty] or f"{x.lineno}:{x.col_offset}" not in safe:
+            return False
+        y.ops = [tx()]
+        swapped = True
+    # with the swaps undone the trees must be identical (positions ignored), which also
+    # means the pairing above lined up the right comparisons
+    return swapped and ast.dump(old) == ast.dump(new)
+
+
 def s_has_doc(node):
     b = node.body[0] if node.body else None
     return isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant) and isinstance(b.value.value, str)
@@ -231,6 +275,7 @@ class Selector:
         self.lines = doc["lines"]
         self.fixtures = doc["fixtures"]
         self.uses = doc["uses"]
+        self.cmp = load_cmp()
         self.by_file = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
@@ -313,6 +358,8 @@ class Selector:
         sel = set()
         if f.startswith("sqlglot/typing/"):
             sel |= set(self.by_file.get("tests/test_typing.py", []))  # compares source/code objects
+        if only_safe_swaps(old_text, new_text, self.cmp.get(f)):
+            return sel
         index = self.tree(f, old_text)
         for line in changed_old_lines(hunks):
             s = innermost(index, line)
