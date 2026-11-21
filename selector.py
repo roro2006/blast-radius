@@ -509,20 +509,42 @@ class Selector:
         return best[1]
 
 
+    def cost(self, bins):
+        return max(sum(self.ms[n] for n in b) for b in bins) + WORKER_MS * len(bins) if bins else 0
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     sel = Selector(tests)
     every = sel.all_tests()
+    verifier = None
+    if os.environ.get("VERIFY", "1") != "0":
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from verify import Verifier
+        verifier = Verifier(SRC, sel.ms, {t["number"]: t["file"] for t in tests},
+                            {t["number"]: t["id"] for t in tests}, apply)
     for patch in sorted((DATA / "commits").glob("*.patch")):
         cid = patch.stem
+        text = patch.read_text(encoding="utf8", errors="replace")
+        verifiable = False
         try:
-            nums = sel.select(patch.read_text(encoding="utf8", errors="replace"))
+            nums = sel.select(text)
             why = f"{len(nums)} tests"
+            verifiable = True
         except RunAll as e:
             nums, why = every, f"ALL ({e})"
         except Exception as e:  # never crash: an unexplained change runs everything
             nums, why = every, f"ALL (error {type(e).__name__}: {e})"
-        print(json.dumps({"commit": cid, "workers": sel.pack(nums)}), flush=True)
+        bins = sel.pack(nums)
+        if verifier is not None and verifiable and nums:
+            try:
+                kept, note = verifier.refine(parse_patch(text), nums, sel.cost(bins))
+                if kept is not nums:
+                    nums, bins = kept, sel.pack(kept)
+                why += f", {note}"
+            except Exception as e:
+                why += f", verify error {type(e).__name__}: {e}"
+        print(json.dumps({"commit": cid, "workers": bins}), flush=True)
         log(f"{cid}: {why}")
 
 

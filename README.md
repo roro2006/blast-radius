@@ -16,6 +16,14 @@ commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`.
 | Test file | the edited tests, their class, or their module |
 | Anything else (renames, new files, binary, config, shared test helpers) | every test |
 
+Then, for commits that touch only `sqlglot/*.py`, `verify.py` runs the candidate tests on the
+patched source when the expected saving beats twice their estimated CPU, and keeps only the
+tests that did not cleanly pass (fail, error, skip, slow, timeout, crash and not-collected all
+keep a test). It mirrors the pinned tree into `/tmp/w` with symlinks, overwrites the patched
+files, and forks a child per commit from a parent that already imported pytest. Bytecode for
+the mirror is precompiled at build time under `PYTHONPYCACHEPREFIX=/app/pyc`. `VERIFY=0`
+turns it off.
+
 Tests are packed longest-first onto 1–8 workers, keeping the count with the lowest
 cost (busiest worker + 2 s per worker).
 
