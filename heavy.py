@@ -186,7 +186,7 @@ class Heavy:
             # execute steps may run at most what the drop is worth
             plan["tpcds"]["budget"] = max(0.5, saving / 1000 / CPU_MULT / MARGIN
                                           - IMPORT_CPU - MAXN_CPU)
-        res = self.run(files, plan, timeout=4 * est + 3)
+        res = self.run(files, plan, timeout=2 * est + 2)  # a slow patched query only keeps tests
         kept = set(nums)
         notes = []
         for k, n in (("max_nodes", self.maxn), ("tpcds", self.tpcds)):
@@ -362,6 +362,8 @@ def _tpcds(plan, queries):
     todo.sort(key=lambda i: queries[i]["Ow"] + (queries[i]["Ew"] if i in need_e else 0))
     for i in todo:
         q = queries[i]
+        if time.process_time() - t0 > plan["budget"]:
+            return "budget spent"
         e = trees[i]
         ts = {x.name: table(x.name) for x in find_tables(e)}
         o, tabs = optimize_step(e, ts)
