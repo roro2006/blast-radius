@@ -35,12 +35,17 @@ HEAVY_FILES = {          # modules with costly imports or class setup (duckdb, p
     "tests/test_executor.py": 0.6,
 }
 RUN_FACTOR = 0.35        # recorded test seconds -> our CPU seconds (recorded runs were slower)
-# The board's CPU figure ran ~3x our local measurement for the plain selector; plan with 2x.
-CPU_MULT = float(os.environ.get("VERIFY_CPU_MULT", "2"))
+# The board's CPU figure ran ~3x our local measurement for the plain selector; plan for that
+# until a board run with verification says otherwise.
+CPU_MULT = float(os.environ.get("VERIFY_CPU_MULT", "3"))
 # Chance a source-code commit's candidates all pass (5 of 7 on the sample). Fixture and
 # test-file edits nearly always break their tests (0 of 9), so they are never verified.
 P_PASS_CODE = 0.6
-TIME_BUDGET = float(os.environ.get("VERIFY_BUDGET", "100"))  # wall seconds for all verification
+# Stop verifying once this many wall seconds have passed since start (60% of the 180 s
+# practice limit; the final allows 270 s): the rest get the static selection, so the run
+# cannot time out because of verification.
+WALL_BUDGET = float(os.environ.get("VERIFY_WALL_BUDGET", "108"))
+START = time.time()
 BASELINE = os.environ.get("BASELINE", "/app/baseline_fail.json")  # written at build time
 
 
@@ -183,21 +188,26 @@ class Verifier:
     def __init__(self, src, ms, file_of, id_of, apply):
         self.src, self.ms, self.file_of, self.id_of, self.apply = src, ms, file_of, id_of, apply
         self.spent = 0.0
-        self.ready = False
+        self.ready = None  # set up on first use: the static path never imports pytest
         try:
             self.baseline = set(json.loads(Path(BASELINE).read_text()))
         except (OSError, ValueError):
             self.baseline = set()
-        log(f"verify: {len(self.baseline)} tests already fail before any patch")
-        try:
-            t = time.time()
-            build_farm(src)
-            _cap_pools()
-            import pytest  # noqa: F401  (imported once, shared by every forked child)
-            self.ready = True
-            log(f"verify: farm ready in {time.time() - t:.2f}s")
-        except Exception as e:  # verification is an optimisation; never fail the run
-            log(f"verify: disabled ({type(e).__name__}: {e})")
+
+    def setup(self):
+        if self.ready is None:
+            self.ready = False
+            try:
+                t = time.time()
+                build_farm(self.src)
+                _cap_pools()
+                import pytest  # noqa: F401  (imported once, shared by every forked child)
+                self.ready = True
+                log(f"verify: farm ready in {time.time() - t:.2f}s; "
+                    f"{len(self.baseline)} tests never dropped")
+            except Exception as e:  # verification is an optimisation; never fail the run
+                log(f"verify: disabled ({type(e).__name__}: {e})")
+        return self.ready
 
     def est_cpu(self, nums):
         files = {self.file_of[n] for n in nums}
@@ -207,7 +217,7 @@ class Verifier:
     def worth_it(self, files, nums, cost_ms):
         """Verify when the expected saving beats the (inflated) CPU it costs. Only commits
         that touch nothing but sqlglot/*.py qualify; see P_PASS_CODE."""
-        if not (self.ready and nums):
+        if not nums or self.ready is False:
             return False
         if not all((fd["new"] or "").startswith("sqlglot/") and fd["new"].endswith(".py")
                    and fd["old"] == fd["new"] for fd in files):
@@ -273,8 +283,12 @@ class Verifier:
             self.spent += time.time() - t0
 
     def refine(self, files, nums, cost_ms):
-        if not self.worth_it(files, nums, cost_ms) or self.spent > TIME_BUDGET:
+        if not self.worth_it(files, nums, cost_ms):
             return nums, "kept"
+        if time.time() - START > WALL_BUDGET:
+            return nums, "kept (wall budget spent)"
+        if not self.setup():
+            return nums, "kept (verify unavailable)"
         import resource
         est = self.est_cpu(nums)
         t = time.time()
@@ -289,21 +303,66 @@ class Verifier:
                      f"(est {est:.2f}) {tfiles}")
 
 
-def baseline(src, out, workers="4"):
-    """Build time: run the whole suite on the unpatched tree and record what fails here."""
+# Build-time runs of the whole unpatched suite. A test failing in any of them is never dropped
+# by verification and never stops a verification run: it depends on something other than
+# the code (hash seed, time zone, test order, the environment).
+VARIANTS = [
+    ("default", {}, False),
+    ("hashseed", {"PYTHONHASHSEED": "12345"}, False),
+    ("timezone", {"TZ": "Pacific/Kiritimati"}, False),  # UTC+14: crosses the date line
+    ("reversed", {}, True),
+]
+
+
+class _Reverse:
+    @staticmethod
+    def pytest_collection_modifyitems(session, config, items):
+        items.reverse()
+
+
+def _baseline_run(name, env, reverse, workers, r):
+    """In a fresh process (os.environ and the time zone must be set before anything runs)."""
     import pytest
-    build_farm(src)
+    os.environ.update(env)
+    time.tzset()
     os.chdir(FARM)
     sys.path.insert(0, str(FARM))
     col = Collector({})
     col.pytest_sessionstart = lambda session: None  # never stop: record every failure
-    code = pytest.main(["-q", "--tb=no", "-p", "no:cacheprovider", "-n", workers, "--timeout", "300",
-                 "--rootdir", str(FARM), "tests"], plugins=[col])
-    if code not in (0, 1):  # 0 all passed, 1 some failed; anything else is a broken run
-        sys.exit(f"baseline: pytest exited {code}")
-    failed = sorted(set(col.why) - {k for k, v in col.why.items() if " skipped:" in v})
-    Path(out).write_text(json.dumps(failed))
-    print(f"baseline: {len(failed)} failing: {failed[:10]}")
+    plugins = [col] + ([_Reverse()] if reverse else [])
+    # reversed order runs in one process so the order is what it says
+    dist = ["-p", "no:xdist"] if reverse else ["-n", workers]
+    code = pytest.main(["-q", "--tb=no", "-p", "no:cacheprovider", *dist, "--timeout", "300",
+                        "--rootdir", str(FARM), "tests"], plugins=plugins)
+    failed = sorted(k for k, v in col.why.items() if " skipped:" not in v)
+    return code, failed
+
+
+def baseline(src, out, workers="4"):
+    build_farm(src)
+    union = set()
+    for name, env, reverse in VARIANTS:
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            try:
+                code, failed = _baseline_run(name, env, reverse, workers, r)
+                os.write(w, json.dumps({"code": int(code), "failed": failed}).encode())
+            finally:
+                os._exit(0)
+        os.close(w)
+        buf = b""
+        while chunk := os.read(r, 1 << 16):
+            buf += chunk
+        os.waitpid(pid, 0)
+        res = json.loads(buf)
+        if res["code"] not in (0, 1):  # 0 all passed, 1 some failed; anything else is broken
+            sys.exit(f"baseline {name}: pytest exited {res['code']}")
+        print(f"baseline {name}: {len(res['failed'])} failing {res['failed'][:5]}", flush=True)
+        union |= set(res["failed"])
+    Path(out).write_text(json.dumps(sorted(union)))
+    print(f"baseline: {len(union)} tests never dropped")
 
 
 if __name__ == "__main__" and sys.argv[1:2] == ["baseline"]:

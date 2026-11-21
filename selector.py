@@ -42,17 +42,59 @@ def log(*a):
 
 # --------------------------------------------------------------------------- maps
 
+class Sets:
+    """The maps' test sets, delta-packed in the file; each is decoded on first use (a run
+    touches a few hundred of them)."""
+
+    def __init__(self, packed):
+        self.packed, self.done = packed, {}
+
+    def __getitem__(self, i):
+        s = self.done.get(i)
+        if s is None:
+            s, acc = [], 0
+            for k, d in enumerate(self.packed[i]):
+                acc = d if k == 0 else acc + d
+                s.append(acc)
+            self.done[i] = s
+        return s
+
+
 def load_maps():
     with gzip.open(MAPS, "rt") as f:
         doc = json.load(f)
-    sets = []
-    for packed in doc["sets"]:
-        s, acc = [], 0
-        for i, d in enumerate(packed):
-            acc = d if i == 0 else acc + d
-            s.append(acc)
-        sets.append(s)
-    return doc, sets
+    return doc, Sets(doc["sets"])
+
+
+class Source:
+    """sqlglot/*.py text, for finding the lines that mention a name."""
+
+    def __init__(self):
+        self.files = None
+
+    def occurrences(self, name):
+        """(file, line) of every line where `name` appears as an identifier before any `#`.
+        A superset of tokenizing each comment-stripped line: a name glued to a leading digit
+        also counts."""
+        if self.files is None:
+            self.files = []
+            for p in sorted((SRC / "sqlglot").rglob("*.py")):
+                text = p.read_text(encoding="utf8")
+                self.files.append((p.relative_to(SRC).as_posix(), text))
+        pat = re.compile(r"(?<![A-Za-z_])" + re.escape(name) + r"(?!\w)")
+        out = []
+        for rel, text in self.files:
+            last, pos, line = -1, 0, 1
+            for m in pat.finditer(text):
+                line += text.count("\n", pos, m.start())  # running count: one pass per file
+                pos = m.start()
+                start = text.rfind("\n", 0, m.start()) + 1
+                if "#" in text[start:m.start()]:
+                    continue
+                if line != last:
+                    out.append((rel, line))
+                    last = line
+        return out
 
 
 def load_cmp():
@@ -152,12 +194,29 @@ def same_program(old_text, new_text, old_code, new_code):
     The AST check is needed because 3.13 stores each class's first line as a constant."""
     if old_code is None:
         return False
+    if code_key(old_code) == code_key(new_code):
+        return True
     try:
-        if ast.dump(ast.parse(old_text)) == ast.dump(ast.parse(new_text)):
-            return True
+        return same_ast(ast.parse(old_text), ast.parse(new_text))
     except SyntaxError:
         return False
-    return code_key(old_code) == code_key(new_code)
+
+
+_POS = {"lineno", "col_offset", "end_lineno", "end_col_offset"}
+
+
+def same_ast(a, b):
+    """ast.dump(a) == ast.dump(b) (positions ignored), stopping at the first difference."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        for f in a._fields:
+            if f not in _POS and not same_ast(getattr(a, f, None), getattr(b, f, None)):
+                return False
+        return True
+    if isinstance(a, list):
+        return len(a) == len(b) and all(same_ast(x, y) for x, y in zip(a, b))
+    return a == b and repr(a) == repr(b)  # repr: 1 vs True, 0.0 vs -0.0
 
 
 def compiles(text, name):
@@ -279,7 +338,7 @@ class Selector:
         self.by_file = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
-        self._words = None
+        self.source = Source()
         self._runtime = {}
         self._trees = {}
 
@@ -301,21 +360,10 @@ class Selector:
             self._trees[f] = stmt_index(ast.parse(text))
         return self._trees[f]
 
-    def words(self):
-        if self._words is None:
-            self._words = {}
-            for p in (SRC / "sqlglot").rglob("*.py"):
-                rel = p.relative_to(SRC).as_posix()
-                for i, line in enumerate(p.read_text(encoding="utf8").splitlines(), 1):
-                    code = line.split("#", 1)[0]
-                    for w in set(re.findall(r"[A-Za-z_]\w*", code)):
-                        self._words.setdefault(w, []).append((rel, i))
-        return self._words
-
     def readers(self, names, skip):
         res = set()
         for n in names:
-            for f, l in self.words().get(n, ()):
+            for f, l in self.source.occurrences(n):
                 if (f, l) not in skip:
                     sid = self.lines.get(f, {}).get(str(l))
                     if sid is not None:
@@ -358,7 +406,10 @@ class Selector:
         sel = set()
         if f.startswith("sqlglot/typing/"):
             sel |= set(self.by_file.get("tests/test_typing.py", []))  # compares source/code objects
-        if only_safe_swaps(old_text, new_text, self.cmp.get(f)):
+        # a swap needs `is`/`==`/`!=` on a changed line; skip the two-tree walk otherwise
+        swap_tokens = any(re.search(r"\bis\b|==|!=", l[1:])
+                          for _, body in hunks for l in body if l[0] in "+-")
+        if swap_tokens and only_safe_swaps(old_text, new_text, self.cmp.get(f)):
             return sel
         index = self.tree(f, old_text)
         for line in changed_old_lines(hunks):
@@ -506,7 +557,67 @@ class Selector:
             cost = max(loads) + WORKER_MS * w
             if best is None or cost < best[0]:
                 best = (cost, [b for b in bins if b])
+            # longest-first is an approximation: search for a strictly smaller busiest worker
+            if w > 1 and len(order) > w:
+                try:
+                    exact = self.exact_bins(order, w, max(loads))
+                except Exception as e:  # never worse than longest-first
+                    log(f"exact packing failed: {type(e).__name__}: {e}")
+                    exact = None
+                if exact is not None:
+                    cost = max(sum(self.ms[n] for n in b) for b in exact) + WORKER_MS * w
+                    if cost < best[0]:
+                        best = (cost, exact)
         return best[1]
+
+    def exact_bins(self, order, w, limit, budget=20000):
+        """Branch and bound: w bins whose busiest is strictly below `limit`, the smallest found
+        within `budget` search nodes, or None. `order` is longest first. Past 60 tests only the
+        24 longest are searched and the rest are placed longest-first (the caller keeps the
+        result only when it is strictly better)."""
+        total = sum(self.ms[n] for n in order)
+        lower = max(self.ms[order[0]], -(-total // w))
+        if lower >= limit:
+            return None  # longest-first is already optimal
+        head, tail = (order, []) if len(order) <= 60 else (order[:24], order[24:])
+        if tail:
+            limit = 10 ** 12  # the head alone has no useful bound; the caller compares
+        ms = [self.ms[n] for n in head]
+        loads, assign = [0] * w, [0] * len(ms)
+        state = {"best": limit, "bins": None, "nodes": 0}
+
+        def go(i):
+            if state["nodes"] > budget or state["best"] <= lower:
+                return
+            state["nodes"] += 1
+            if i == len(ms):
+                state["best"] = max(loads)
+                state["bins"] = list(assign)
+                return
+            seen = set()
+            for b in sorted(range(w), key=lambda b: loads[b]):
+                if loads[b] in seen:  # bins with equal loads are interchangeable
+                    continue
+                seen.add(loads[b])
+                if loads[b] + ms[i] >= state["best"]:
+                    continue
+                loads[b] += ms[i]
+                assign[i] = b
+                go(i + 1)
+                loads[b] -= ms[i]
+
+        go(0)
+        if state["bins"] is None:
+            return None
+        bins, loads = [[] for _ in range(w)], [0] * w
+        for n, b in zip(head, state["bins"]):
+            bins[b].append(n)
+            loads[b] += self.ms[n]
+        for n in tail:
+            i = loads.index(min(loads))
+            loads[i] += self.ms[n]
+            bins[i].append(n)
+        return [b for b in bins if b]
 
 
     def cost(self, bins):
