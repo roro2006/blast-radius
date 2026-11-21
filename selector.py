@@ -201,6 +201,11 @@ def innermost(index, line):
     return best
 
 
+def s_has_doc(node):
+    b = node.body[0] if node.body else None
+    return isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant) and isinstance(b.value.value, str)
+
+
 def bound_names(node):
     names = set()
     for n in ast.walk(node):
@@ -326,8 +331,9 @@ class Selector:
                 # signature/decorators/bases run at import; its callers are its readers
                 names = {node.name}
                 if not isinstance(node, ast.ClassDef):
-                    first = node.body[0]
-                    sel |= self.covering(f, first.lineno, first.lineno)  # whoever runs it
+                    # whoever runs it (the docstring is not an executed line: skip it)
+                    body = node.body[1:] if s_has_doc(node) and len(node.body) > 1 else node.body
+                    sel |= self.covering(f, body[0].lineno, body[0].lineno)
             elif s.doc:
                 continue
             else:
