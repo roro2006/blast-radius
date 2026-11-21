@@ -17,7 +17,9 @@ Per changed file:
 Stdout carries only answer lines; logs go to stderr.
 """
 import ast
+import pickle
 import gzip
+import itertools
 import json
 import os
 import re
@@ -44,17 +46,23 @@ def log(*a):
 
 # --------------------------------------------------------------------------- maps
 
+class LazySets:
+    """Delta-encoded test sets, decoded on first use."""
+
+    def __init__(self, packed):
+        self.packed, self.done = packed, {}
+
+    def __getitem__(self, i):
+        r = self.done.get(i)
+        if r is None:
+            r = self.done[i] = list(itertools.accumulate(self.packed[i]))
+        return r
+
+
 def load_maps():
     with gzip.open(MAPS, "rt") as f:
         doc = json.load(f)
-    sets = []
-    for packed in doc["sets"]:
-        s, acc = [], 0
-        for i, d in enumerate(packed):
-            acc = d if i == 0 else acc + d
-            s.append(acc)
-        sets.append(s)
-    return doc, sets
+    return doc, LazySets(doc["sets"])
 
 
 def load_cmp():
@@ -166,6 +174,72 @@ def same_program(old_text, new_text, old_code, new_code):
     return code_key(old_code) == code_key(new_code)
 
 
+def _pair(a, b):
+    if isinstance(a, str):
+        return ast.parse(a), ast.parse(b)
+    return pickle.loads(pickle.dumps((a, b), protocol=pickle.HIGHEST_PROTOCOL))
+
+
+def changed_new_lines(hunks):
+    """New-file line numbers of added lines."""
+    res, shift = set(), 0
+    for start, body in hunks:
+        n = start + shift
+        for l in body:
+            if l[0] == "+":
+                res.add(n)
+                n += 1
+                shift += 1
+            elif l[0] == "-":
+                shift -= 1
+            else:
+                n += 1
+    return res
+
+
+def _span(x):
+    lo = min([d.lineno for d in getattr(x, "decorator_list", [])] + [x.lineno])
+    return lo, x.end_lineno
+
+
+def _header_same(x, y):
+    """Everything but the body is identical (name, arguments, bases, decorators, ...)."""
+    for field in x._fields:
+        if field == "body":
+            continue
+        a, b = getattr(x, field), getattr(y, field)
+        if isinstance(a, list):
+            a = [ast.dump(v) if isinstance(v, ast.AST) else v for v in a]
+            b = [ast.dump(v) if isinstance(v, ast.AST) else v for v in b]
+        elif isinstance(a, ast.AST):
+            a, b = ast.dump(a), (ast.dump(b) if isinstance(b, ast.AST) else b)
+        if a != b:
+            return False
+    return True
+
+
+def focus(a, b, old_lines, new_lines):
+    """The smallest differing statement pairs of two statement lists, descending into
+    classes and functions whose headers are unchanged; None when the lists don't line up."""
+    if len(a) != len(b):
+        return None
+    out = []
+    for x, y in zip(a, b):
+        xs, xe = _span(x)
+        ys, ye = _span(y)
+        if not any(xs <= l <= xe for l in old_lines) and not any(ys <= l <= ye for l in new_lines):
+            continue  # untouched text
+        if type(x) is type(y) and isinstance(x, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and _header_same(x, y):
+            sub = focus(x.body, y.body, old_lines, new_lines)
+            if sub is not None:
+                out.extend(sub)
+                continue
+        if ast.dump(x) != ast.dump(y):
+            out.append((x, y))
+    return out
+
+
 def compiles(text, name):
     try:
         return compile(text, name, "exec", dont_inherit=True)
@@ -231,7 +305,7 @@ def only_safe_swaps(old_text, new_text, safe):
     if not safe:
         return False
     try:
-        old, new = ast.parse(old_text), ast.parse(new_text)
+        old, new = _pair(old_text, new_text)
     except SyntaxError:
         return False
     a, b = eq_compares(old), eq_compares(new)
@@ -256,7 +330,7 @@ def lambda_changes(old_text, new_text):
     (else None). A lambda body runs only when the lambda is called, so its own line
     coverage says exactly which tests can see the change."""
     try:
-        old, new = ast.parse(old_text), ast.parse(new_text)
+        old, new = _pair(old_text, new_text)
     except SyntaxError:
         return None
     a = [n for n in ast.walk(old) if isinstance(n, ast.Lambda)]
@@ -277,7 +351,7 @@ def constant_only(old_text, new_text):
     """True when the files differ only in constants, each keeping its type (so a class- or
     module-level statement still evaluates without error at import)."""
     try:
-        old, new = ast.parse(old_text), ast.parse(new_text)
+        old, new = _pair(old_text, new_text)
     except SyntaxError:
         return False
     a = [n for n in ast.walk(old) if isinstance(n, ast.Constant)]
@@ -341,7 +415,7 @@ def cond_changes(old_text, new_text):
     """When the files differ only in and<->or of chains (same operands) and in comparison
     operators the profile can judge, the old tree and [(old node, kind, detail)]; else None."""
     try:
-        old, new = ast.parse(old_text), ast.parse(new_text)
+        old, new = _pair(old_text, new_text)
     except SyntaxError:
         return None
     ob = [n for n in ast.walk(old) if isinstance(n, ast.BoolOp)]
@@ -448,6 +522,8 @@ class Selector:
         self._words = None
         self._runtime = {}
         self._trees = {}
+        self._mods = {}
+        self._sources = None
 
     # -- helpers
     def nums(self, set_id):
@@ -462,9 +538,14 @@ class Selector:
                 res |= self.nums(sid)
         return res
 
+    def module(self, f, text):
+        if f not in self._mods:
+            self._mods[f] = ast.parse(text)
+        return self._mods[f]
+
     def tree(self, f, text):
         if f not in self._trees:
-            self._trees[f] = stmt_index(ast.parse(text))
+            self._trees[f] = stmt_index(self.module(f, text))
         return self._trees[f]
 
     def words(self):
@@ -478,14 +559,33 @@ class Selector:
                         self._words.setdefault(w, []).append((rel, i))
         return self._words
 
+    def sources(self):
+        if self._sources is None:
+            self._sources = []
+            for p in sorted((SRC / "sqlglot").rglob("*.py")):
+                self._sources.append([p.relative_to(SRC).as_posix(), p.read_text(encoding="utf8"), None])
+        return self._sources
+
     def readers(self, names, skip):
+        """Tests covering a line (outside `skip`) that mentions any of the names in code."""
+        names = sorted(n for n in names if n)
         res = set()
-        for n in names:
-            for f, l in self.words().get(n, ()):
-                if (f, l) not in skip:
-                    sid = self.lines.get(f, {}).get(str(l))
-                    if sid is not None:
-                        res |= self.nums(sid)
+        if not names:
+            return res
+        rx = re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(map(re.escape, names)) + r")(?![A-Za-z0-9_])")
+        for src in self.sources():
+            f, text, starts = src
+            m = self.lines.get(f)
+            if not m or not any(n in text for n in names):
+                continue  # plain substring test first: most files mention none of them
+            for hit in rx.finditer(text):
+                pos = hit.start()
+                l = text.count("\n", 0, pos) + 1
+                if "#" in text[text.rfind("\n", 0, pos) + 1:pos] or (f, l) in skip:
+                    continue  # in a comment (same rule as before: anything after '#')
+                sid = m.get(str(l))
+                if sid is not None:
+                    res |= self.nums(sid)
         return res
 
     def runtime_tests(self, f):
@@ -634,20 +734,32 @@ class Selector:
     def sqlglot_py(self, f, hunks):
         old_text = (SRC / f).read_text(encoding="utf8")
         new_text = apply(old_text, hunks)
-        old_code, new_code = compiles(old_text, f), compiles(new_text, f)
-        if new_code is None:
+        new_lines = changed_new_lines(hunks)
+        try:
+            new_tree = ast.parse(new_text)
+            # compile the changed top-level statements (catches return-outside-function etc.)
+            touched = [x for x in new_tree.body
+                       if any(_span(x)[0] <= l <= _span(x)[1] for l in new_lines)]
+            compile(ast.Module(touched or new_tree.body, []), f, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError):
             raise RunAll(f"{f} no longer compiles")
-        if same_program(old_text, new_text, old_code, new_code):
-            return set()
+        old_tree = self.module(f, old_text)
+        pairs = focus(old_tree.body, new_tree.body, changed_old_lines(hunks), new_lines)
+        if pairs is None:
+            old_m, new_m = old_tree, new_tree
+        elif not pairs:
+            return set()  # same program (comments, whitespace)
+        else:
+            old_m, new_m = ast.Module([x for x, _ in pairs], []), ast.Module([y for _, y in pairs], [])
         sel = set()
         if f.startswith("sqlglot/typing/"):
             sel |= set(self.by_file.get("tests/test_typing.py", []))  # compares source/code objects
-        if only_safe_swaps(old_text, new_text, self.cmp.get(f)):
+        if only_safe_swaps(old_m, new_m, self.cmp.get(f)):
             return sel
-        affected = self.cond_affected(f, old_text, new_text)
+        affected = self.cond_affected(f, old_m, new_m)
         if affected is not None:
             return sel | affected
-        spans = lambda_changes(old_text, new_text)
+        spans = lambda_changes(old_m, new_m)
         if spans is not None:
             for lo, hi in spans:
                 sel |= self.covering(f, lo, hi)
@@ -667,7 +779,7 @@ class Selector:
                 continue
             if not s.doc:
                 if consts is None:
-                    consts = constant_only(old_text, new_text)
+                    consts = constant_only(old_m, new_m)
                 if not consts:
                     # anything but a same-type constant swap can fail at import, which breaks
                     # every user of the class (or module), not just the readers of the name
