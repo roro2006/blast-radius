@@ -32,8 +32,10 @@ WORKER_MS = 2000
 MAX_WORKERS = 8
 LAMBDA_RULE = os.environ.get("LAMBDA_RULE", "1") != "0"
 ANNOTATION_RULE = os.environ.get("ANNOTATION_RULE", "1") != "0"
-REORDER_RULE = os.environ.get("REORDER_RULE", "0") == "1"  # off until validated on labeled mutants
+REORDER_RULE = os.environ.get("REORDER_RULE", "1") != "0"  # 12 labeled reorder mutants: 0 misses
 VALPROF_RULE = os.environ.get("VALPROF_RULE", "1") != "0"
+HEAVY_RULE = os.environ.get("HEAVY_RULE", "1") != "0"  # heavy.py: check the two slowest tests
+ADDED_RULE = os.environ.get("ADDED_RULE", "1") != "0"  # new .py files nothing imports yet
 VALPROF = Path(os.environ.get("VALPROF", Path(__file__).resolve().parent / "maps" / "valprof"))
 
 
@@ -136,7 +138,8 @@ def parse_patch(text):
             m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)", line)
             if not m:
                 raise RunAll("bad hunk header")
-            cur["hunks"].append([int(m.group(1)), []])
+            # "-N,0" (a pure insertion without context) inserts after old line N
+            cur["hunks"].append([int(m.group(1)) + (m.group(2) == "0"), []])
         elif cur["hunks"] and line[:1] in (" ", "+", "-"):
             cur["hunks"][-1][1].append(line)
         elif cur["hunks"] and line.startswith("\\"):
@@ -779,7 +782,11 @@ class Selector:
         removed = [l[1:] for _, body in hunks for l in body if l[0] == "-"]
         added = [l[1:] for _, body in hunks for l in body if l[0] == "+"]
         changed = removed + added
-        if ANNOTATION_RULE and annotations_only(old_text, new_text):
+        # cheap necessary conditions first: every changed code line of an annotation-only edit
+        # carries a `:`, `->` or an import (multi-line annotations just skip the rule)
+        if ANNOTATION_RULE and all(re.search(r":|->|\bimport\b|TYPE_CHECKING", l) or not l.strip()
+                                   or l.lstrip().startswith("#") for l in changed) \
+                and annotations_only(old_text, new_text):
             return sel  # annotations are never evaluated here
         if REORDER_RULE and any(l.lstrip().startswith(("def ", "async def ")) for l in removed)                 and any(l.lstrip().startswith(("def ", "async def ")) for l in added)                 and methods_reordered(old_text, new_text):
             return sel  # same methods, same bodies, other order
@@ -788,7 +795,9 @@ class Selector:
                           for _, body in hunks for l in body if l[0] in "+-")
         if swap_tokens and only_safe_swaps(old_text, new_text, self.cmp.get(f)):
             return sel
-        if LAMBDA_RULE:
+        old_lines = old_text.splitlines()
+        if LAMBDA_RULE and any("lambda" in l for start, body in hunks
+                               for l in old_lines[max(0, start - 30):start + len(body) + 1]):
             # only lambda bodies changed: the tests whose run executed those bodies
             spans = lambda_body_changes(old_text, new_text)
             if spans is not None:
@@ -959,6 +968,8 @@ class Selector:
             return set(self.by_file.get("tests/test_sqlglotc.py", []))
         if path.startswith("tests/") and not path.endswith(".py"):
             return self.fixture(path, is_new)
+        if is_new and ADDED_RULE and path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
+            return self.added_py(path)
         if is_new or is_del:
             raise RunAll(f"added/deleted {path}")
         if path.startswith("sqlglot/") and path.endswith(".py"):
@@ -967,15 +978,42 @@ class Selector:
             return self.test_py(path, hunks)
         raise RunAll(f"unmapped {path}")
 
+    def added_py(self, path):
+        """A new module runs only if something imports it. Nothing in the pinned tree can
+        (its name must not appear anywhere there), so only this patch's other files can: each
+        of them that mentions it gets every test that runs any of its functions (an import
+        that fails or misbehaves breaks the whole importer)."""
+        p = Path(path)
+        if p.stem in ("__init__", "conftest") or p.name == "helpers.py" or p.stem.startswith("_"):
+            raise RunAll(f"added {path}")
+        pat = re.compile(r"(?<![A-Za-z_])" + re.escape(p.stem) + r"(?!\w)")
+        for root in ("sqlglot", "tests"):
+            for q in (SRC / root).rglob("*.py"):
+                if pat.search(q.read_text(encoding="utf8")):
+                    raise RunAll(f"added {path}: its name is already used")
+        self._added.append(pat)
+        return set()
+
     def select(self, patch_text):
         files = parse_patch(patch_text)
         if not files:
             return set()
         sel = set()
+        self._added = []
         for fd in files:
             if not (fd["old"] or fd["new"]):
                 raise RunAll("unnamed file")
             sel |= self.select_file(fd)
+        for pat in self._added:
+            for fd in files:
+                f = fd["old"]
+                if f and fd["new"] and any(l[0] == "+" and pat.search(l) for _, b in fd["hunks"] for l in b):
+                    if f.startswith("sqlglot/"):
+                        sel |= self.runtime_tests(f)
+                    elif f.startswith("tests/"):
+                        sel |= set(self.by_file.get(f, ()))
+                    else:
+                        raise RunAll(f"{f} uses an added module")
         return sel
 
     # -- packing
@@ -1064,6 +1102,14 @@ def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     sel = Selector(tests)
     every = sel.all_tests()
+    heavy = None
+    if HEAVY_RULE:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from heavy import Heavy
+            heavy = Heavy(sel, SRC, apply)
+        except Exception as e:
+            log(f"heavy: unavailable ({type(e).__name__}: {e})")
     verifier = None
     if os.environ.get("VERIFY", "1") != "0":
         sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1083,6 +1129,16 @@ def main():
         except Exception as e:  # never crash: an unexplained change runs everything
             nums, why = every, f"ALL (error {type(e).__name__}: {e})"
         bins = sel.pack(nums)
+        if heavy is not None and verifiable and nums:
+            try:
+                files = parse_patch(text)
+                kept, note = heavy.refine(files, nums, sel.pack, sel.cost)
+                if kept != nums:
+                    nums, bins = kept, sel.pack(kept)
+                if note:
+                    why += f", {note}"
+            except Exception as e:
+                why += f", heavy error {type(e).__name__}: {e}"
         if verifier is not None and verifiable and nums:
             try:
                 kept, note = verifier.refine(parse_patch(text), nums, sel.cost(bins))

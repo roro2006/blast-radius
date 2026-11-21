@@ -20,7 +20,8 @@ commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`.
 | `sqlglot/typing/*.py` | adds `tests/test_typing.py` (it inspects that source) |
 | Fixture under `tests/` | tests that opened that file |
 | Test file | the edited tests, their class, or their module |
-| Anything else (renames, new files, binary, config, shared test helpers) | every test |
+| New `sqlglot/` or `tests/` module whose name appears nowhere in the pinned tree | none itself; each other patched file that mentions it adds every test that runs any of its functions |
+| Anything else (renames, deletions, binary, config, shared test helpers) | every test |
 
 Each of the value-profile rules falls back to the rows above when the profile cannot decide
 (the value was used at import, operands were not plain values, an operand raised, ...).
@@ -32,6 +33,34 @@ pass (fail, error, skip, slow, timeout, crash and not-collected all keep a test)
 pinned tree into `/tmp/w` with symlinks, overwrites the patched files, and forks a child per
 commit from a parent that already imported pytest. On the practice board it cost ~2.5 s CPU
 and saved ~0.01 s, hence off.
+
+### The two slowest tests (`heavy.py`)
+
+`test_max_nodes` (~29 s) and `test_execute_tpcds` (~21 s) cover thousands of core parser,
+optimizer and executor lines, so the maps pick them for most core edits, though few of those
+edits break them. When dropping them would lower a commit's cost by more than the check's
+CPU (counted at three times our local CPU, plus a margin), a forked child imports the
+patched sqlglot from a symlinked mirror of the pinned tree (`/tmp/w`, bytecode precompiled
+at build time) and checks them directly:
+
+* **test_max_nodes** only asserts that a few parses succeed or raise the max-nodes error with
+  the right message. The child runs the same assertions with the wide query and both limits
+  divided by 50 (same nesting depth, same nodes-to-limit ratios): about 0.2 s instead of 29.
+* **test_execute_tpcds** parses 99 TPC-DS queries, executes 57 on the Python executor and
+  compares each with duckdb's result for `transpile(sql, write="duckdb")`.
+  `maps/heavy.json.gz` (`tools/heavy/`) holds, from the pinned tree, a fingerprint of every
+  step's output (parse tree, optimized tree, result rows, duckdb SQL) and which lines each
+  query's optimize and execute steps ran, recorded per query in a fresh process so lazily
+  built caches count for every query that needs them. The child re-parses and re-transpiles
+  every query, optimizes only the queries that ran a changed function (or whose parse
+  changed), and executes only those whose optimized tree changed or whose execute step
+  ran a changed function. If every fingerprint matches, every subtest sees exactly what it
+  saw on the pinned tree, where the test passes.
+
+The tpcds check applies only when the patch edits nothing but function bodies of existing
+`sqlglot/*.py` files, none of which ran before the first query (imports, class setup,
+pickling tables for the pool). Any mismatch, exception, timeout or budget overrun keeps the
+test. Rebuild the map with `sh tools/heavy/build.sh`.
 
 Tests are packed longest-first onto 1–8 workers, keeping the count with the lowest
 cost (busiest worker + 2 s per worker).
