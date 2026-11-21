@@ -30,6 +30,11 @@ MAPS = Path(os.environ.get("MAPS", Path(__file__).resolve().parent / "maps" / "m
 CMP = Path(os.environ.get("CMP", Path(__file__).resolve().parent / "maps" / "cmp.json.gz"))
 WORKER_MS = 2000
 MAX_WORKERS = 8
+LAMBDA_RULE = os.environ.get("LAMBDA_RULE", "1") != "0"
+ANNOTATION_RULE = os.environ.get("ANNOTATION_RULE", "1") != "0"
+REORDER_RULE = os.environ.get("REORDER_RULE", "0") == "1"  # off until validated on labeled mutants
+VALPROF_RULE = os.environ.get("VALPROF_RULE", "1") != "0"
+VALPROF = Path(os.environ.get("VALPROF", Path(__file__).resolve().parent / "maps" / "valprof"))
 
 
 class RunAll(Exception):
@@ -197,12 +202,22 @@ def same_program(old_text, new_text, old_code, new_code):
     if code_key(old_code) == code_key(new_code):
         return True
     try:
-        return same_ast(ast.parse(old_text), ast.parse(new_text))
+        return same_ast(parse_shared(old_text), ast.parse(new_text))
     except SyntaxError:
         return False
 
 
 _POS = {"lineno", "col_offset", "end_lineno", "end_col_offset"}
+_SHARED = {}
+
+
+def parse_shared(text):
+    """Parse of the pinned (unpatched) source, shared by every rule. Never mutate it: rules
+    only change the tree of the patched text, which they parse themselves."""
+    tree = _SHARED.get(text)
+    if tree is None:
+        tree = _SHARED[text] = ast.parse(text)
+    return tree
 
 
 def same_ast(a, b):
@@ -284,7 +299,7 @@ def only_safe_swaps(old_text, new_text, safe):
     if not safe:
         return False
     try:
-        old, new = ast.parse(old_text), ast.parse(new_text)
+        old, new = parse_shared(old_text), ast.parse(new_text)
     except SyntaxError:
         return False
     a, b = eq_compares(old), eq_compares(new)
@@ -302,6 +317,360 @@ def only_safe_swaps(old_text, new_text, safe):
     # with the swaps undone the trees must be identical (positions ignored), which also
     # means the pairing above lined up the right comparisons
     return swapped and ast.dump(old) == ast.dump(new)
+
+
+RUNTIME_ANNOTATIONS = ("dataclass", "NamedTuple", "TypedDict", "get_type_hints", "__annotations__",
+                       "annotationlib", "signature(", "pydantic", "attrs")
+
+
+def _strip_annotations(tree):
+    """Drop what `from __future__ import annotations` never evaluates: parameter, return and
+    variable annotations, and the bodies of `if TYPE_CHECKING:` blocks."""
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            n.returns = None
+        elif isinstance(n, ast.arg):
+            n.annotation = None
+        elif isinstance(n, ast.AnnAssign):
+            n.annotation = ast.Constant(None)
+        elif isinstance(n, ast.If):
+            test = n.test
+            name = test.id if isinstance(test, ast.Name) else test.attr if isinstance(test, ast.Attribute) else None
+            if name == "TYPE_CHECKING":
+                n.body = [ast.Pass()]
+    return tree
+
+
+def annotations_only(old_text, new_text):
+    """True when the files differ only in annotations / TYPE_CHECKING imports, in a module where
+    annotations are never evaluated and nothing reads them at run time."""
+    if any(w in old_text or w in new_text for w in RUNTIME_ANNOTATIONS):
+        return False
+    try:
+        old, new = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return False
+
+    def future(tree):
+        return any(isinstance(s, ast.ImportFrom) and s.module == "__future__"
+                   and any(a.name == "annotations" for a in s.names) for s in tree.body)
+
+    return future(old) and future(new) and same_ast(_strip_annotations(old), _strip_annotations(new))
+
+
+def methods_reordered(old_text, new_text):
+    """True when the files differ only in the order of methods inside class bodies: each class
+    keeps the same undecorated methods (unique names, identical bodies, no default values,
+    which are evaluated at definition) and its other statements in the same order."""
+    try:
+        old, new = parse_shared(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return False
+    a = [n for n in ast.walk(old) if isinstance(n, ast.ClassDef)]
+    b = [n for n in ast.walk(new) if isinstance(n, ast.ClassDef)]
+    if len(a) != len(b):
+        return False
+    moved = False
+    for x, y in zip(a, b):
+        def movable(s):
+            return (isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and not s.decorator_list
+                    and not s.args.defaults and not any(s.args.kw_defaults))
+        fx = [s for s in x.body if movable(s)]
+        fy = [s for s in y.body if movable(s)]
+        names = [s.name for s in fx]
+        if len(set(names)) != len(names) or sorted(names) != sorted(s.name for s in fy):
+            return False
+        # every name bound in the class body must be bound once, or order could matter
+        bound = [t.id for s in x.body if isinstance(s, (ast.Assign, ast.AnnAssign))
+                 for t in (s.targets if isinstance(s, ast.Assign) else [s.target]) if isinstance(t, ast.Name)]
+        bound += [s.name for s in x.body if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        if len(set(bound)) != len(bound):
+            return False
+        if [s.name for s in fx] != [s.name for s in fy]:
+            moved = True
+            # put the new tree's methods back in the old order; same_ast below then also
+            # checks that every method body is unchanged
+            by_name = {s.name: s for s in fy}
+            it = iter(by_name[s.name] for s in fx)
+            y.body = [next(it) if movable(s) else s for s in y.body]
+    return moved and same_ast(old, new)
+
+
+# --------------------------------------------------------------------------- value profile edits
+# Each returns a description of the one edit when old and new differ by exactly that edit, else
+# None. Sites are "line:col" of the node in the old (pinned) file, as tools/cov/valprof.py
+# records them.
+
+REL_OPS = {ast.Lt: 0, ast.LtE: 1, ast.Gt: 2, ast.GtE: 3, ast.Eq: 4, ast.NotEq: 5}
+
+
+def _only_difference(old, new, nodes_old, nodes_new, differs, undo):
+    """Pair nodes in walk order; exactly one pair may differ (per `differs`); after `undo` the
+    trees must be identical. Returns the old node of that pair or None."""
+    if len(nodes_old) != len(nodes_new):
+        return None
+    hit = None
+    for x, y in zip(nodes_old, nodes_new):
+        if same_ast(x, y):
+            continue
+        if hit is not None or not differs(x, y):
+            return None
+        hit = (x, y)
+    if hit is None:
+        return None
+    undo(*hit)
+    return hit[0] if same_ast(old, new) else None
+
+
+def relational_op_change(old, new):
+    """(site, old op index, new op index) for one changed relational operator."""
+    def cmps(t):
+        return [n for n in ast.walk(t) if isinstance(n, ast.Compare)]
+
+    def differs(x, y):
+        return (len(x.ops) == len(y.ops) == 1 and type(x.ops[0]) in REL_OPS
+                and type(y.ops[0]) in REL_OPS and type(x.ops[0]) is not type(y.ops[0])
+                and same_ast(x.left, y.left) and same_ast(x.comparators, y.comparators))
+
+    new_op = []
+
+    def undo(x, y):
+        new_op.append(REL_OPS[type(y.ops[0])])  # read before the undo overwrites it
+        y.ops = list(x.ops)
+
+    a, b = cmps(old), cmps(new)
+    x = _only_difference(old, new, a, b, differs, undo)
+    if x is None:
+        return None
+    return f"{x.lineno}:{x.col_offset}", REL_OPS[type(x.ops[0])], new_op[0]
+
+
+def _condition_boolops(tree):
+    """Two-operand and/or nodes in condition position (if / while / ternary / assert / not),
+    the ones the profiler instruments."""
+    out = []
+    for n in ast.walk(tree):
+        test = (n.test if isinstance(n, (ast.If, ast.While, ast.IfExp, ast.Assert))
+                else n.operand if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not) else None)
+        if isinstance(test, ast.BoolOp) and len(test.values) == 2:
+            out.append(test)
+    return out
+
+
+def boolop_swap(old, new):
+    """site of one `and` <-> `or` swap in a condition."""
+    bo = [n for n in ast.walk(old) if isinstance(n, ast.BoolOp)]
+    bn = [n for n in ast.walk(new) if isinstance(n, ast.BoolOp)]
+    cond = {id(n) for n in _condition_boolops(old)}
+
+    def differs(x, y):
+        return (id(x) in cond and len(x.values) == len(y.values) == 2
+                and type(x.op) is not type(y.op) and same_ast(x.values, y.values))
+
+    def undo(x, y):
+        y.op = x.op
+
+    x = _only_difference(old, new, bo, bn, differs, undo)
+    return None if x is None else f"{x.lineno}:{x.col_offset}"
+
+
+def _assigned_dicts(tree):
+    """Dict literals assigned (Assign / AnnAssign value) outside any function: the ones the
+    profiler turns into tracking dicts."""
+    out = []
+
+    def walk(node, in_func):
+        for c in ast.iter_child_nodes(node):
+            f = in_func or isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            if not f and isinstance(c, (ast.Assign, ast.AnnAssign)) and isinstance(c.value, ast.Dict):
+                out.append(c.value)
+            walk(c, f)
+
+    walk(tree, False)
+    return out
+
+
+def dict_entry_change(old, new):
+    """(site, changed-value keys, added keys, removed keys, added key reprs) when one tracked
+    dict literal changed only in its entries; keys are their source text."""
+    do, dn = _assigned_dicts(old), _assigned_dicts(new)
+    if len(do) != len(dn):
+        return None
+    hit = None
+    for x, y in zip(do, dn):
+        if not same_ast(x, y):
+            if hit is not None:
+                return None
+            hit = (x, y)
+    if hit is None:
+        return None
+    x, y = hit
+
+    def entries(d):
+        out = []
+        for k, v in zip(d.keys, d.values):
+            out.append(("**" + ast.unparse(v), None) if k is None else (ast.unparse(k), v))
+        return out
+
+    eo, en = entries(x), entries(y)
+    ko, kn = [k for k, _ in eo], [k for k, _ in en]
+    if len(set(ko)) != len(ko) or len(set(kn)) != len(kn):
+        return None  # duplicate keys: last one wins, order games
+    common_o = [k for k in ko if k in set(kn)]
+    common_n = [k for k in kn if k in set(ko)]
+    if common_o != common_n:
+        return None  # reordered entries
+    vo, vn = dict(eo), dict(en)
+    if any(k.startswith("**") for k in set(ko) ^ set(kn)):
+        return None  # a ** splat added or removed
+    if any(k.startswith("**") and not same_ast(vo[k], vn[k]) for k in common_o):
+        return None
+    changed = {k for k in common_o if not k.startswith("**") and not same_ast(vo[k], vn[k])}
+    added, removed = set(kn) - set(ko), set(ko) - set(kn)
+    reprs = set()
+    for k in added:
+        node = next(kk for kk in y.keys if kk is not None and ast.unparse(kk) == k)
+        try:
+            value = ast.literal_eval(node)
+        except (ValueError, SyntaxError, TypeError):
+            return None  # a computed key: we cannot match it against recorded misses
+        reprs.add(repr(value))
+    y.keys, y.values = list(x.keys), list(x.values)  # undo; the rest must be identical
+    if not same_ast(old, new):
+        return None
+    return f"{x.lineno}:{x.col_offset}", changed, added, removed, reprs
+
+
+_IN_FUNC = {}
+
+
+def in_function_sites(tree):
+    """"line:col" of every Compare / BoolOp inside a function or lambda body (comprehensions at
+    module or class level run at import and do not count)."""
+    key = id(tree)
+    if key not in _IN_FUNC:
+        out = set()
+
+        def walk(node, in_func):
+            for c in ast.iter_child_nodes(node):
+                f = in_func or isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                if f and isinstance(c, (ast.Compare, ast.BoolOp)):
+                    out.add(f"{c.lineno}:{c.col_offset}")
+                walk(c, f)
+
+        walk(tree, False)
+        _IN_FUNC[key] = (tree, out)  # keep the tree alive so its id is not reused
+    return _IN_FUNC[key][1]
+
+
+class ValueProfile:
+    """maps/valprof/ (tools/build_valprof.py): an index and one shard per source file, each
+    loaded on first use."""
+
+    def __init__(self, path):
+        self.path, self.index, self.shards = Path(path), None, {}
+
+    def load(self):
+        if self.index is None:
+            try:
+                self.index = json.loads((self.path / "index.json").read_text())
+            except (OSError, ValueError):
+                self.index = {}
+        return self.index
+
+    def site(self, kind, f, key):
+        if f not in self.shards:
+            shard = {}
+            if f in set(self.load().get("files", ())):
+                try:
+                    with gzip.open(self.path / (f.replace("/", "__") + ".json.gz"), "rt") as fh:
+                        shard = json.load(fh)
+                except (OSError, ValueError):
+                    shard = None  # a listed shard that cannot be read: decide nothing
+            self.shards[f] = shard
+        shard = self.shards[f]
+        if shard is None:
+            raise LookupError(f)
+        return shard.get(kind, {}).get(key)
+
+    def select_cmp(self, f, key, a, b):
+        """Tests where operator a and b ever disagreed, or None (unknown: use other rules)."""
+        site = self.site("cmps", f, key)
+        if not self.load():
+            return None
+        if site is None:
+            return set()  # never evaluated, at import or in any test
+
+        def flips(masks):
+            return any(m < 0 or ((m >> a) & 1) != ((m >> b) & 1) for m in masks)
+
+        if site["imp"] is not None and flips(site["imp"]):
+            return None
+        return {n for ns, masks in site["t"] if flips(masks) for n in ns}
+
+    def select_bool(self, f, key):
+        site = self.site("bools", f, key)
+        if not self.load() or [f, key] in self.load().get("unbalanced", []):
+            return None
+        if site is None:
+            return set()
+
+        def flips(pairs):
+            return any(not (isinstance(p, list) and len(p) == 2 and isinstance(p[0], bool)
+                            and isinstance(p[1], bool) and p[0] == p[1]) for p in pairs)
+
+        if site["imp"] is not None and flips(site["imp"]):
+            return None
+        return {n for ns, pairs in site["t"] if flips(pairs) for n in ns}
+
+    def select_dict(self, f, key, changed, added, removed, reprs):
+        site = self.site("dicts", f, key)
+        if not self.load() or site is None:
+            return None  # a tracked dict is built at import: absent means not profiled
+        touched = added | removed
+        # copied, iterated or mutated anywhere: class creation (which sqlglot may run inside
+        # the first test that imports a dialect) and caches build on such copies, so the
+        # tests that later use the copy are not in the records
+        recs = ([site["imp"]] if site["imp"] is not None else []) + [rec for _, rec in site["t"]]
+        if any(rec[3] & (2 | 4 | 8) for rec in recs):
+            return None
+
+        def hit(rec):
+            get, inn, miss, flags = set(rec[0]), set(rec[1]), set(rec[2]), rec[3]
+            if flags & (4 | 8):  # values exposed or mutated
+                return True
+            if touched and flags & (1 | 2):  # size or key set observed
+                return True
+            if changed & get or touched & (get | inn) or reprs & miss:
+                return True
+            return "<unhashable>" in get or "<other>" in miss and bool(added)
+
+        if site["imp"] is not None and hit(site["imp"]):
+            return None  # read at import (copied, iterated, looked up): effects are global
+        return {n for ns, rec in site["t"] if hit(rec) for n in ns}
+
+
+def lambda_body_changes(old_text, new_text):
+    """[(first, last) old line span of each changed lambda body] when the two files differ only
+    inside lambda bodies (same lambdas in the same places, same parameters and defaults),
+    else None. Such a change can only matter when a changed lambda is called."""
+    try:
+        old, new = parse_shared(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return None
+    a = [n for n in ast.walk(old) if isinstance(n, ast.Lambda)]
+    b = [n for n in ast.walk(new) if isinstance(n, ast.Lambda)]
+    if not a or len(a) != len(b):
+        return None
+    spans = []
+    for x, y in zip(a, b):
+        if same_ast(x.body, y.body):
+            continue
+        if not same_ast(x.args, y.args):
+            return None
+        spans.append((x.body.lineno, x.body.end_lineno))
+        y.body = x.body  # undo the change; the rest of the file must then be identical
+    return spans if spans and same_ast(old, new) else None
 
 
 def s_has_doc(node):
@@ -335,6 +704,7 @@ class Selector:
         self.fixtures = doc["fixtures"]
         self.uses = doc["uses"]
         self.cmp = load_cmp()
+        self.vp = ValueProfile(VALPROF)
         self.by_file = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
@@ -357,7 +727,7 @@ class Selector:
 
     def tree(self, f, text):
         if f not in self._trees:
-            self._trees[f] = stmt_index(ast.parse(text))
+            self._trees[f] = stmt_index(parse_shared(text))
         return self._trees[f]
 
     def readers(self, names, skip):
@@ -406,11 +776,40 @@ class Selector:
         sel = set()
         if f.startswith("sqlglot/typing/"):
             sel |= set(self.by_file.get("tests/test_typing.py", []))  # compares source/code objects
+        removed = [l[1:] for _, body in hunks for l in body if l[0] == "-"]
+        added = [l[1:] for _, body in hunks for l in body if l[0] == "+"]
+        changed = removed + added
+        if ANNOTATION_RULE and annotations_only(old_text, new_text):
+            return sel  # annotations are never evaluated here
+        if REORDER_RULE and any(l.lstrip().startswith(("def ", "async def ")) for l in removed)                 and any(l.lstrip().startswith(("def ", "async def ")) for l in added)                 and methods_reordered(old_text, new_text):
+            return sel  # same methods, same bodies, other order
         # a swap needs `is`/`==`/`!=` on a changed line; skip the two-tree walk otherwise
         swap_tokens = any(re.search(r"\bis\b|==|!=", l[1:])
                           for _, body in hunks for l in body if l[0] in "+-")
         if swap_tokens and only_safe_swaps(old_text, new_text, self.cmp.get(f)):
             return sel
+        if LAMBDA_RULE:
+            # only lambda bodies changed: the tests whose run executed those bodies
+            spans = lambda_body_changes(old_text, new_text)
+            if spans is not None:
+                index = self.tree(f, old_text)
+                hits = []
+                for lo, hi in spans:
+                    cov = self.covering(f, lo, hi)
+                    s = innermost(index, lo)
+                    if not cov and not (s and s.in_func):
+                        # a top-level lambda no test ran may still run at import (collection
+                        # time, not credited to any test): leave it to the general rules
+                        break
+                    hits.append(cov)
+                else:
+                    for cov in hits:
+                        sel |= cov
+                    return sel
+        if VALPROF_RULE:
+            vp = self.valprof_select(f, old_text, new_text, changed)
+            if vp is not None:
+                return sel | vp
         index = self.tree(f, old_text)
         for line in changed_old_lines(hunks):
             s = innermost(index, line)
@@ -447,6 +846,43 @@ class Selector:
             if not names:
                 sel |= self.covering(f, s.lo, s.end)
         return sel
+
+    def valprof_select(self, f, old_text, new_text, changed=None):
+        """Exact selections for single-operator, and/or and dict-entry edits from the value
+        profile, or None when the edit is not one of those or the profile cannot decide."""
+        res = None
+        # gates on the changed text: a skipped rule only falls back to the general rules
+        text = "\n".join(changed) if changed is not None else None
+        try:
+            old = parse_shared(old_text)
+            r = None
+            if text is None or re.search(r"[<>]|==|!=", text):
+                r = relational_op_change(old, ast.parse(new_text))
+            if r is not None:
+                # code outside functions runs once, at import, and sqlglot imports dialects
+                # lazily: inside whichever test first needs them, so the profile credits that
+                # one test. Only sites in function bodies have per-test records we can trust.
+                res = self.vp.select_cmp(f, *r) if r[0] in in_function_sites(old) else None
+            else:
+                if text is None or re.search(r"\b(and|or)\b", text):
+                    r = boolop_swap(old, ast.parse(new_text))
+                if r is not None:
+                    res = self.vp.select_bool(f, r) if r in in_function_sites(old) else None
+                else:
+                    r = dict_entry_change(old, ast.parse(new_text))
+                    if r is not None:
+                        res = self.vp.select_dict(f, *r)
+        except (SyntaxError, RecursionError, ValueError, LookupError):
+            return None
+        if res is None:
+            return None
+        nums = {n for n in (self.vp_num(i) for i in res) if n is not None}
+        # tests that failed under instrumentation have unreliable records: always keep them
+        return nums | {n for n in (self.vp_num(i) for i in self.vp.load().get("failed", []))
+                       if n is not None}
+
+    def vp_num(self, n):
+        return n if n in self.ms else None
 
     def test_py(self, f, hunks):
         old_text = (SRC / f).read_text(encoding="utf8")

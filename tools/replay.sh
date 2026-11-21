@@ -7,7 +7,7 @@
 set -e
 cd "$(dirname "$0")/.."
 ROOT="$(pwd -W 2>/dev/null || pwd)"
-IMAGE=${IMAGE:-blast-radius-entry}
+IMAGE=${IMAGE:-blast-radius-static}
 if [ "$1" = "--no-build" ]; then shift; else
   docker build --quiet --platform linux/amd64 --tag "$IMAGE" . > /dev/null
 fi
