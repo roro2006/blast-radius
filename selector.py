@@ -734,6 +734,10 @@ class Selector:
     def sqlglot_py(self, f, hunks):
         old_text = (SRC / f).read_text(encoding="utf8")
         new_text = apply(old_text, hunks)
+        if f.endswith("/__main__.py"):
+            # only ever run as a script (python -m sqlglot), never imported: its globals have
+            # no readers elsewhere; whoever ran any of it in-process is all there is
+            return self.covering(f, 1, old_text.count("\n") + 1)
         new_lines = changed_new_lines(hunks)
         try:
             new_tree = ast.parse(new_text)
