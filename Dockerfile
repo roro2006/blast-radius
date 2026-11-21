@@ -17,6 +17,10 @@ ENV PYTHONPYCACHEPREFIX=/app/pyc SKIP_INTEGRATION=0
 RUN python -c "import sys; sys.path.insert(0, '/app'); import verify; verify.build_farm('/app/sqlglot')" \
  && python -m compileall -q /tmp/w/sqlglot /tmp/w/tests \
  && cd /tmp/w && python -m pytest -q -p no:cacheprovider -p no:xdist --collect-only tests > /dev/null \
+ && rm -rf /tmp/w
+# Tests that already fail in this image before any patch (date- or environment-dependent):
+# the verifier always keeps them and does not stop on them. Runs the full suite (~1 min).
+RUN python /app/verify.py baseline /app/sqlglot /app/baseline_fail.json \
  && rm -rf /tmp/w && chmod -R a+rX /app
 ENV PYTHONDONTWRITEBYTECODE=1
 # Not -I: the verifier and its spawned test workers need PYTHONPYCACHEPREFIX.

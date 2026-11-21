@@ -25,6 +25,7 @@ from pathlib import Path
 
 FARM = Path(os.environ.get("FARM", "/tmp/w"))
 POOL_CAP = 2
+POOL_CTX = os.environ.get("VERIFY_POOL_CTX", "fork") or None
 
 # CPU model (seconds), fitted on the sample set in the scoring image.
 FORK_OVERHEAD = 0.12     # child: pytest session + sqlglot import
@@ -33,13 +34,14 @@ HEAVY_FILES = {          # modules with costly imports or class setup (duckdb, p
     "tests/test_optimizer.py": 0.6,
     "tests/test_executor.py": 0.6,
 }
-RUN_FACTOR = 0.6         # recorded test seconds -> our CPU seconds (recorded runs were slower)
+RUN_FACTOR = 0.35        # recorded test seconds -> our CPU seconds (recorded runs were slower)
 # The board's CPU figure ran ~3x our local measurement for the plain selector; plan with 2x.
 CPU_MULT = float(os.environ.get("VERIFY_CPU_MULT", "2"))
 # Chance a source-code commit's candidates all pass (5 of 7 on the sample). Fixture and
 # test-file edits nearly always break their tests (0 of 9), so they are never verified.
 P_PASS_CODE = 0.6
 TIME_BUDGET = float(os.environ.get("VERIFY_BUDGET", "100"))  # wall seconds for all verification
+BASELINE = os.environ.get("BASELINE", "/app/baseline_fail.json")  # written at build time
 
 
 def log(*a):
@@ -106,15 +108,25 @@ class Overlay:
 
 
 class Collector:
-    """pytest plugin: which node ids cleanly passed."""
+    """pytest plugin: which node ids cleanly passed. Stops the session at the first failure
+    of a test that passes on the unpatched tree (once one candidate really fails the commit
+    needs a worker anyway); tests already failing here before the patch never stop it."""
 
-    def __init__(self, limits):
+    def __init__(self, limits, baseline=()):
         self.limits, self.bad, self.passed = limits, set(), set()
+        self.baseline, self.session = set(baseline), None
+        self.why = {}
+
+    def pytest_sessionstart(self, session):
+        self.session = session
 
     def pytest_runtest_logreport(self, report):
         nid = report.nodeid
         if report.failed or report.skipped:
             self.bad.add(nid)
+            self.why.setdefault(nid, f"{report.when} {report.outcome}: {str(report.longrepr)[-300:]}")
+            if report.failed and nid not in self.baseline and self.session is not None:
+                self.session.shouldstop = "candidate failed"
         elif report.when == "call":
             if report.duration > self.limits.get(nid, 2.0):
                 self.bad.add(nid)
@@ -138,28 +150,33 @@ def _cap_pools():
         results are still pickled, so what the tests compute is unchanged."""
 
         def __init__(self, max_workers=None, mp_context=None, *a, **k):
-            super().__init__(min(max_workers or POOL_CAP, POOL_CAP), mp.get_context("fork"), *a, **k)
+            ctx = mp.get_context(POOL_CTX) if POOL_CTX else mp_context
+            super().__init__(min(max_workers or POOL_CAP, POOL_CAP), ctx, *a, **k)
 
     cf.ProcessPoolExecutor = CappedPool
 
 
-def _child(w, ids, limits):
+def _child(w, ids, limits, baseline):
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)  # stdout must carry only answer lines
     os.dup2(devnull, 2)
-    # A runaway patch must not let the container's OOM killer take the selector with it;
-    # hitting this fails the run, which keeps every candidate.
-    import resource
-    resource.setrlimit(resource.RLIMIT_AS, (2_500_000_000, 2_500_000_000))
+    # A runaway patch must not let the container's OOM killer take the selector with it:
+    # make this process its first choice (a killed child keeps every candidate). An address
+    # space limit would break duckdb, which reserves large mappings.
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except OSError:
+        pass
     os.chdir(FARM)
     sys.path.insert(0, str(FARM))
     import pytest
-    col = Collector(limits)
-    # -x: once one candidate fails the commit needs a worker anyway, so stop paying for the rest
-    code = pytest.main(["-q", "-x", "--tb=no", "-p", "no:cacheprovider", "-p", "no:xdist", "-p", "no:randomly",
+    col = Collector(limits, baseline)
+    code = pytest.main(["-q", "--tb=no", "-p", "no:cacheprovider", "-p", "no:xdist", "-p", "no:randomly",
                         "--rootdir", str(FARM), *ids], plugins=[col])
     ok = sorted(col.passed - col.bad)
-    os.write(w, json.dumps({"ok": ok, "code": int(code)}).encode())
+    why = dict(list(col.why.items())[:5]) if os.environ.get("VERIFY_DEBUG") else {}
+    os.write(w, json.dumps({"ok": ok, "code": int(code), "why": why}).encode())
 
 
 class Verifier:
@@ -167,6 +184,11 @@ class Verifier:
         self.src, self.ms, self.file_of, self.id_of, self.apply = src, ms, file_of, id_of, apply
         self.spent = 0.0
         self.ready = False
+        try:
+            self.baseline = set(json.loads(Path(BASELINE).read_text()))
+        except (OSError, ValueError):
+            self.baseline = set()
+        log(f"verify: {len(self.baseline)} tests already fail before any patch")
         try:
             t = time.time()
             build_farm(src)
@@ -208,7 +230,7 @@ class Verifier:
                 try:
                     os.close(r)
                     os.setpgid(0, 0)
-                    _child(w, ids, limits)
+                    _child(w, ids, limits, self.baseline)
                 finally:
                     os._exit(0)
             os.close(w)
@@ -237,8 +259,11 @@ class Verifier:
             if not buf:
                 return None
             res = json.loads(buf)
+            for k, v in res.get("why", {}).items():
+                log(f"  kept {k}: {v}")
             ok = set(res["ok"])
-            return {n for n in nums if self.id_of[n] not in ok}
+            # tests failing here before the patch are never verified away
+            return {n for n in nums if self.id_of[n] not in ok or self.id_of[n] in self.baseline}
         except Exception as e:
             log(f"verify: error ({type(e).__name__}: {e})")
             return None
@@ -262,3 +287,24 @@ class Verifier:
             return nums, "kept (verify failed)"
         return res, (f"verified {len(nums)}->{len(res)} wall {time.time() - t:.2f}s cpu {cpu:.2f}s "
                      f"(est {est:.2f}) {tfiles}")
+
+
+def baseline(src, out, workers="4"):
+    """Build time: run the whole suite on the unpatched tree and record what fails here."""
+    import pytest
+    build_farm(src)
+    os.chdir(FARM)
+    sys.path.insert(0, str(FARM))
+    col = Collector({})
+    col.pytest_sessionstart = lambda session: None  # never stop: record every failure
+    code = pytest.main(["-q", "--tb=no", "-p", "no:cacheprovider", "-n", workers, "--timeout", "300",
+                 "--rootdir", str(FARM), "tests"], plugins=[col])
+    if code not in (0, 1):  # 0 all passed, 1 some failed; anything else is a broken run
+        sys.exit(f"baseline: pytest exited {code}")
+    failed = sorted(set(col.why) - {k for k, v in col.why.items() if " skipped:" in v})
+    Path(out).write_text(json.dumps(failed))
+    print(f"baseline: {len(failed)} failing: {failed[:10]}")
+
+
+if __name__ == "__main__" and sys.argv[1:2] == ["baseline"]:
+    baseline(*sys.argv[2:])
